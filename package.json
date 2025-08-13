@@ -1,0 +1,17 @@
+{
+  "name": "tmdb-similar-addon",
+  "version": "1.0.2",
+  "description": "TMDB addon for Omni with trailers, cast, and a separate Similar Titles section (Movies & Series).",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "needle": "^3.3.1"
+  }
+}
