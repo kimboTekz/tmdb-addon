@@ -1,0 +1,13 @@
+{
+  "id": "org.example.tmdbsimilar",
+  "version": "1.0.2",
+  "name": "TMDB with Separate Similar Titles",
+  "description": "TMDB addon with trailers, cast, and a separate Similar Titles section (Movies & Series).",
+  "resources": ["catalog", "meta"],
+  "types": ["movie", "series"],
+  "idPrefixes": ["tmdb:", "tt"],
+  "catalogs": [
+    { "type": "movie", "id": "tmdb-movies", "name": "Movies (TMDB Discover)" },
+    { "type": "series", "id": "tmdb-series", "name": "Series (TMDB Discover)" }
+  ]
+}
