@@ -1,154 +1,119 @@
-const express = require('express');
-const needle = require('needle');
-const cors = require('cors');
+const express = require("express");
+const favicon = require("serve-favicon");
+const path = require("path");
+const axios = require("axios");
+const addon = express();
+const analytics = require('./utils/analytics');
+const { getCatalog } = require("./lib/getCatalog");
+const { getSearch } = require("./lib/getSearch");
+const { getManifest, DEFAULT_LANGUAGE } = require("./lib/getManifest");
+const { getMeta } = require("./lib/getMeta");
+const { getTmdb } = require("./lib/getTmdb");
+const { cacheWrapMeta } = require("./lib/getCache");
+const { getTrending } = require("./lib/getTrending");
+const { parseConfig, getRpdbPoster, checkIfExists } = require("./utils/parseProps");
+const { getRequestToken, getSessionId } = require("./lib/getSession");
+const { getFavorites, getWatchList } = require("./lib/getPersonalLists");
+const { blurImage } = require('./utils/imageProcessor');
 
-const app = express();
-app.use(cors());
+addon.use(analytics.middleware);
+addon.use(favicon(path.join(__dirname, '../public/favicon.png')));
+addon.use(express.static(path.join(__dirname, '../public')));
+addon.use(express.static(path.join(__dirname, '../dist')));
 
-// ⚙️ TMDB key via env var (Render → Environment → TMDB_API_KEY)
-const TMDB_API_KEY = process.env.TMDB_API_KEY; // set to: ee5efe712fdab14d1f42783d6f02c324
-if (!TMDB_API_KEY) {
-  console.warn('[WARN] TMDB_API_KEY is not set. Set it on Render for the addon to work.');
-}
-const TMDB_BASE = 'https://api.themoviedb.org/3';
-const IMG = (path, size = 'w500') => (path ? `https://image.tmdb.org/t/p/${size}${path}` : null);
+const getCacheHeaders = function (opts) {
+  opts = opts || {};
+  if (!Object.keys(opts).length) return false;
 
-// Serve manifest directly from file
-app.get('/manifest.json', (req, res) => {
-  res.sendFile(__dirname + '/manifest.json');
-});
+  const headersMap = {
+    cacheMaxAge: "max-age",
+    staleRevalidate: "stale-while-revalidate",
+    staleError: "stale-if-error",
+  };
 
-// Simple health check
-app.get('/', (_req, res) => res.send('TMDB Similar Addon is running.'));
+  return Object.entries(headersMap)
+    .map(([optKey, header]) => opts[optKey] ? `${header}=${opts[optKey]}` : false)
+    .filter(Boolean)
+    .join(", ");
+};
 
-// Catalog: TMDB Discover for movies/series
-app.get('/catalog/:type/:id.json', async (req, res) => {
-  const { type } = req.params;
-  const tmdbType = type === 'movie' ? 'movie' : 'tv';
+const respond = function (res, data, opts) {
+  const cacheControl = getCacheHeaders(opts);
+  if (cacheControl) res.setHeader("Cache-Control", `${cacheControl}, public`);
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Headers", "*");
+  res.setHeader("Content-Type", "application/json");
+  res.send(data);
+};
 
-  const url = `${TMDB_BASE}/discover/${tmdbType}?api_key=${TMDB_API_KEY}&include_adult=false&sort_by=popularity.desc`;
+addon.get("/", (_, res) => res.redirect("/configure"));
 
+// ... existing endpoints ...
+
+// =========================================
+// NEW: Similar Titles Endpoint for Omni
+// =========================================
+addon.get("/similar/:type/:tmdbId.json", async (req, res) => {
+  const { type, tmdbId } = req.params;
+  const config = parseConfig(req.query.catalogChoices || "") || {};
+  const language = config.language || DEFAULT_LANGUAGE;
+  const apiKey = process.env.TMDB_API_KEY || "ee5efe712fdab14d1f42783d6f02c324";
+  
+  const tmdbType = (type === "series") ? "tv" : "movie";
+  const endpoint = `${process.env.TMDB_BASE_URL || "https://api.themoviedb.org/3"}/${tmdbType}/${tmdbId}/similar`;
+  
   try {
-    const { body } = await needle('get', url, { json: true });
-    const results = Array.isArray(body?.results) ? body.results : [];
+    const resp = await axios.get(endpoint, {
+      params: { api_key: apiKey, language, page: 1 }
+    });
 
+    const results = resp.data.results || [];
     const metas = results.map(item => ({
-      id: `tmdb:${tmdbType}:${item.id}`,     // stable id format
+      id: `tmdb:${tmdbType}:${item.id}`,
       type,
       name: item.title || item.name,
-      poster: IMG(item.poster_path, 'w500'),
-      background: IMG(item.backdrop_path, 'original'),
-      releaseInfo: (item.release_date || item.first_air_date || '').slice(0, 4),
-      description: item.overview || ''
+      poster: item.poster_path ? `https://image.tmdb.org/t/p/w500${item.poster_path}` : null,
+      background: item.backdrop_path ? `https://image.tmdb.org/t/p/original${item.backdrop_path}` : null,
+      description: item.overview || "",
+      releaseInfo: item.release_date || item.first_air_date || ""
     }));
 
-    res.set('Cache-Control', 'public, max-age=3600');
-    return res.json({ metas, cacheMaxAge: 3600 });
+    respond(res, { metas }, {
+      cacheMaxAge: 86400,
+      staleRevalidate: 604800,
+      staleError: 1209600,
+    });
+
   } catch (err) {
-    console.error('[catalog] error:', err?.message || err);
-    return res.status(500).json({ metas: [], cacheMaxAge: 600 });
+    console.error("Error fetching similar titles:", err.message);
+    res.status(500).json({ error: "Unable to fetch similar titles" });
   }
 });
 
-// Meta: details + trailers/cast + Similar Titles section
-app.get('/meta/:type/:rawId.json', async (req, res) => {
-  const { type, rawId } = req.params;        // type is 'movie' or 'series'
-  const preferred = type === 'series' ? 'tv' : 'movie';
+// =======================================
+// Continue existing handlers below...
+// =======================================
 
-  // Accept ids like: tmdb:movie:123, tmdb:tv:456, or tt1234567 (IMDb)
-  function parseId(s) {
-    if (!s) return null;
-    if (/^tmdb:(movie|tv):\d+$/.test(s)) {
-      const [, k, id] = s.split(':');
-      return { scheme: 'tmdb', kind: k, id };
-    }
-    if (/^tt\d{7,}$/.test(s)) return { scheme: 'imdb', id: s };
-    return null;
-  }
-
-  async function tmdbFindByImdb(imdbId, preferKind) {
-    const url = `${TMDB_BASE}/find/${imdbId}?api_key=${TMDB_API_KEY}&external_source=imdb_id`;
-    const { body } = await needle('get', url, { json: true });
-    if (preferKind === 'movie' && body?.movie_results?.length) return { kind: 'movie', id: body.movie_results[0].id };
-    if (preferKind === 'tv' && body?.tv_results?.length) return { kind: 'tv', id: body.tv_results[0].id };
-    if (body?.movie_results?.length) return { kind: 'movie', id: body.movie_results[0].id };
-    if (body?.tv_results?.length) return { kind: 'tv', id: body.tv_results[0].id };
-    return null;
-  }
-
-  try {
-    const parsed = parseId(rawId);
-    let tmdbId = null;
-    let kind = preferred;
-
-    if (parsed?.scheme === 'tmdb') {
-      tmdbId = parsed.id;
-      kind = parsed.kind || preferred;
-    } else if (parsed?.scheme === 'imdb') {
-      const mapped = await tmdbFindByImdb(parsed.id, preferred);
-      if (mapped) { tmdbId = mapped.id; kind = mapped.kind; }
-    } else {
-      return res.json({ meta: null });
-    }
-
-    if (!tmdbId) return res.json({ meta: null });
-
-    // details + videos + credits
-    const detailsUrl = `${TMDB_BASE}/${kind}/${tmdbId}?api_key=${TMDB_API_KEY}&append_to_response=videos,credits,external_ids`;
-    const similarUrl = `${TMDB_BASE}/${kind}/${tmdbId}/similar?api_key=${TMDB_API_KEY}&page=1`;
-
-    const [{ body: det }, { body: sim }] = await Promise.all([
-      needle('get', detailsUrl, { json: true }),
-      needle('get', similarUrl, { json: true })
-    ]);
-
-    // build meta
-    const name = kind === 'tv' ? (det?.name || det?.original_name) : (det?.title || det?.original_title);
-    const year = (kind === 'tv' ? det?.first_air_date : det?.release_date) || '';
-
-    let trailer = null;
-    const vids = det?.videos?.results || [];
-    const yt = vids.find(v => v.site === 'YouTube' && v.type === 'Trailer');
-    if (yt) trailer = `https://www.youtube.com/watch?v=${yt.key}`;
-
-    const cast = (det?.credits?.cast || []).slice(0, 12).map(c => c.name);
-
-    const meta = {
-      id: rawId.startsWith('tmdb:') ? rawId : `tmdb:${kind}:${tmdbId}`,
-      type, // 'movie' or 'series'
-      name,
-      description: det?.overview || '',
-      poster: IMG(det?.poster_path, 'w500'),
-      background: IMG(det?.backdrop_path, 'original'),
-      releaseInfo: year.slice(0, 4),
-      cast,
-      trailer,
-      // 👇 Separate “Similar Titles” section rendered as an extra catalog
-      extras: [
-        {
-          name: "Similar Titles",
-          type: "catalog",
-          id: `similar-${kind}-${tmdbId}`,
-          metas: (sim?.results || []).map(s => ({
-            id: `tmdb:${kind}:${s.id}`,
-            type,
-            name: s.title || s.name,
-            poster: IMG(s.poster_path, 'w500'),
-            background: IMG(s.backdrop_path, 'original'),
-            description: s.overview || '',
-            releaseInfo: (s.release_date || s.first_air_date || '').slice(0, 4)
-          }))
-        }
-      ]
-    };
-
-    res.set('Cache-Control', 'public, max-age=86400');
-    return res.json({ meta });
-  } catch (err) {
-    console.error('[meta] error:', err?.message || err);
-    return res.json({ meta: null });
-  }
+addon.get("/:catalogChoices?/manifest.json", async (req, res) => {
+  const config = parseConfig(req.params.catalogChoices) || {};
+  const manifest = await getManifest(config);
+  respond(res, manifest, {
+    cacheMaxAge: 12 * 60 * 60,
+    staleRevalidate: 14 * 24 * 60 * 60,
+    staleError: 30 * 24 * 60 * 60
+  });
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`TMDB Similar Addon running on port ${PORT}`));
+addon.get("/:catalogChoices?/catalog/:type/:id/:extra?.json", async function (req, res) {
+  // your existing catalog logic...
+});
+
+addon.get("/:catalogChoices?/meta/:type/:id.json", async function (req, res) {
+  // your existing meta logic...
+});
+
+addon.get("/api/image/blur", async function (req, res) {
+  // your existing blur logic...
+});
+
+module.exports = addon;
